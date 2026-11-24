@@ -8,6 +8,7 @@ export default function Offline() {
       <h1>You are offline</h1>
       <p>Laundry-Map needs a connection to load this page. Check your network and try again.</p>
       <p className="muted">Orders you already submitted are safe. Live status refreshes when you are back online.</p>
+      <p className="muted">The demo map on the home page works offline only after it has finished loading once in this session.</p>
       <a href="/"><button>Try again</button></a>
     </main>
   );
