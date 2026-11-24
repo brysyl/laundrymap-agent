@@ -2,7 +2,10 @@ import Link from "next/link";
 import dynamic from "next/dynamic";
 import { authHref } from "@/lib/authRoutes";
 
+import { MapSkeleton } from "@/components/MapSkeleton";
+
 const DashboardLink = dynamic(() => import("@/components/DashboardLink"));
+const LaundryMap = dynamic(() => import("@/components/LaundryMap"), { loading: () => <MapSkeleton /> });
 
 const ROLES = [
   { title: "Customer", text: "Find vendors near you, pay securely and track pickup and delivery in real time." },
@@ -32,6 +35,7 @@ export default function Home() {
             <DashboardLink />
           </div>
         </section>
+        <LaundryMap />
         <section className="roles" aria-label="Who it is for">
           {ROLES.map((r) => (
             <article className="role-card" key={r.title}>

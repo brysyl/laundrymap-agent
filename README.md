@@ -9,7 +9,7 @@ What is implemented today:
 - Customers pay through Paystack and track an order by status, with live Socket.IO updates. A courier's location is posted to the API while a job is active.
 - Vendors accept and process orders. Couriers claim and deliver them with a delivery OTP. Admins approve vendors and couriers, issue refunds and record payouts.
 
-Not implemented: there is no interactive map. The frontend has no map tiles or map widget, so "corridor map discovery" means the nearby-vendor list, and tracking means order status and live updates, not a courier pin on a map. Nothing in the code models water quality, soap or detergent products. Vendors list a unit price and customers describe items as free text, so the blue-water and detergent positioning is branding, not a feature.
+Map: the home page (`/`) has an interactive local SVG demo corridor map (search, service filter, sort, vendor details and a demo pickup flow) driven by static demo data in `frontend/src/lib/demoVendors.ts`. It is not a tile map and not live vendor data, makes no API calls, and every element is labelled "Demo Data". The backend seed is unchanged; the Abuja side vendors exist only in the frontend demo data. In the signed-in app, discovery is the nearby-vendor list, and tracking means order status and live updates, not a courier pin on a map. Nothing in the code models water quality, soap or detergent products. Vendors list a unit price and customers describe items as free text, so the blue-water and detergent positioning is branding, not a feature.
 
 - `frontend/`: Next.js 16 PWA (service worker, offline queue, role dashboards).
 - `backend/`: Express 4 and Socket.IO API in TypeScript, with PostgreSQL/PostGIS, Redis, and an in-memory store and cache for development and tests.
