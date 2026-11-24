@@ -2,7 +2,7 @@
   "name": "laundrymap",
   "private": true,
   "version": "0.1.0",
-  "workspaces": ["backend"],
+  "workspaces": ["backend", "frontend"],
   "engines": { "node": ">=20" },
   "scripts": {
     "typecheck": "npm run typecheck --workspaces --if-present",

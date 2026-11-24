@@ -3,6 +3,7 @@ FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.base.json ./
 COPY backend/package.json backend/
+COPY frontend/package.json frontend/
 RUN npm ci --workspace=backend --include-workspace-root
 COPY backend backend
 RUN npm run build --workspace=backend
@@ -12,6 +13,7 @@ ENV NODE_ENV=production
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY backend/package.json backend/
+COPY frontend/package.json frontend/
 RUN npm ci --workspace=backend --omit=dev --include-workspace-root && npm cache clean --force
 COPY --from=build /app/backend/dist backend/dist
 COPY backend/migrations backend/migrations
