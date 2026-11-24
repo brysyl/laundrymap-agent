@@ -16,7 +16,7 @@ COPY backend/package.json backend/
 COPY frontend/package.json frontend/
 RUN npm ci --workspace=backend --omit=dev --include-workspace-root && npm cache clean --force
 COPY --from=build /app/backend/dist backend/dist
-COPY backend/migrations backend/migrations
+COPY --from=build /app/backend/migrations backend/migrations
 USER node
 EXPOSE 4000
 WORKDIR /app/backend
