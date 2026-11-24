@@ -13,7 +13,7 @@ export function useUser(required?: Role): User | null {
   const [user, setUser] = useState<User | null>(null);
   useEffect(() => {
     const u = tokenStore.user();
-    if (!u || !tokenStore.get()) { router.replace("/login"); return; }
+    if (!u || !tokenStore.get()) { router.replace("/auth"); return; }
     if (required && u.role !== required) { router.replace(HOME[u.role]); return; }
     setUser(u);
   }, [router, required]);
@@ -27,7 +27,7 @@ export function Shell({ title, user, children }: { title: string; user: User | n
       <header className="top">
         <Link href="/" className="brand">Laundry-Map</Link>
         {user && (
-          <button className="ghost" onClick={() => { tokenStore.clear(); router.replace("/login"); }}>Sign out ({user.name})</button>
+          <button className="ghost" onClick={() => { tokenStore.clear(); router.replace("/auth"); }}>Sign out ({user.name})</button>
         )}
       </header>
       <h1>{title}</h1>

@@ -37,6 +37,7 @@ describe("service worker routing", () => {
   it("handles navigations with network-first offline fallback", () => {
     expect(cls("/customer", "GET", "navigate")).toBe("navigate");
     expect(cls("/", "GET", "navigate")).toBe("navigate");
+    for (const a of ["/auth", "/login", "/register"]) expect(cls(a, "GET", "navigate"), a).toBe("navigate");
   });
 
   it("does not intercept the worker script itself", () => {
