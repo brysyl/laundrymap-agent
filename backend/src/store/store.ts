@@ -45,8 +45,13 @@ export interface Store {
   listOrders(f: OrderFilter): Promise<Order[]>;
   listExpiredAwaiting(now: Date, limit: number): Promise<Order[]>;
 
+  /** Throws a 409 `payment_pending` conflict if the order already has a PENDING payment. */
   createPayment(p: Payment): Promise<Payment>;
+  getPayment(id: string): Promise<Payment | null>;
   getPaymentByReference(reference: string): Promise<Payment | null>;
+  /** The confirmed payment for an order, if any. Refunds must target this one. */
+  getPaidPaymentByOrder(orderId: string): Promise<Payment | null>;
+  listPaymentsByStatus(status: Payment["status"], limit: number): Promise<Payment[]>;
   getPaymentByOrder(orderId: string): Promise<Payment | null>;
   updatePayment(id: string, patch: Partial<Pick<Payment, "status" | "gatewayTransactionId" | "paidAt">>): Promise<Payment | null>;
 
@@ -56,12 +61,17 @@ export interface Store {
   /** Append-only. There is intentionally no update or delete. */
   appendLedger(entries: LedgerEntry[]): Promise<void>;
   listLedger(f: { orderId?: string; account?: string; limit?: number }): Promise<LedgerEntry[]>;
+  /** Serializes concurrent transactions touching `account` until the transaction ends. Call inside tx(). */
+  lockAccount(account: string): Promise<void>;
   /** credits minus debits */
   accountBalance(account: string): Promise<bigint>;
   trialBalance(): Promise<{ debits: bigint; credits: bigint }>;
 
   createRefund(r: Refund): Promise<Refund>;
+  getRefund(id: string): Promise<Refund | null>;
   getRefundByOrder(orderId: string): Promise<Refund | null>;
+  /** Refunds in one of `statuses` created at or before `olderThan`, oldest first. */
+  listRefundsByStatus(statuses: Refund["status"][], olderThan: Date, limit: number): Promise<Refund[]>;
   updateRefund(id: string, patch: Partial<Pick<Refund, "status" | "gatewayRef">>): Promise<Refund | null>;
   listRefunds(limit: number): Promise<Refund[]>;
 

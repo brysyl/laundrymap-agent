@@ -5,6 +5,8 @@ export interface RealtimeMessage {
   event: string;
   data: unknown;
 }
+/** Reserved event name: the realtime layer disconnects the target rooms instead of delivering it. */
+export const SESSION_REVOKED = "session:revoked";
 export type Publisher = (m: RealtimeMessage) => void;
 
 export const room = {
@@ -12,6 +14,8 @@ export const room = {
   customer: (userId: string) => `customer:${userId}`,
   vendor: (vendorId: string) => `vendor:${vendorId}`,
   courier: (userId: string) => `courier:${userId}`,
+  /** Every socket of a user joins this room, so a session can be revoked by user id. */
+  user: (userId: string) => `user:${userId}`,
   admin: "admin",
   couriersOnline: "couriers:online",
 };

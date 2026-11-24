@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { bannerMessage, connectionStore } from "@/lib/connectionStore";
-import { getQueue } from "@/lib/api";
+import { getQueue, tokenStore } from "@/lib/api";
 import { submitGuard } from "@/lib/submitGuard";
 import { canApplyUpdate } from "@/lib/swPolicy";
 
@@ -16,7 +16,7 @@ export function PwaClient() {
     const sync = () => connectionStore.set({ online: navigator.onLine, queued: queue.size });
     const flush = async () => {
       if (!navigator.onLine || queue.size === 0) return sync();
-      await queue.flush();
+      await queue.flush(tokenStore.user()?.id ?? null);
       sync();
     };
     const onOnline = () => { sync(); void flush(); };

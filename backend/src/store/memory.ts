@@ -160,7 +160,24 @@ export class MemoryStore implements Store {
       .map(clone);
   }
 
-  async createPayment(p: Payment) { this.state.payments.set(p.id, clone(p)); return clone(p); }
+  async createPayment(p: Payment) {
+    if (p.status === "PENDING") {
+      for (const x of this.state.payments.values()) {
+        if (x.orderId === p.orderId && x.status === "PENDING") throw conflict("payment_pending", "Order already has a pending payment");
+      }
+    }
+    this.state.payments.set(p.id, clone(p));
+    return clone(p);
+  }
+  async getPayment(id: string) { return clone(this.state.payments.get(id) ?? null); }
+  async getPaidPaymentByOrder(orderId: string) {
+    for (const p of this.state.payments.values()) if (p.orderId === orderId && p.status === "PAID") return clone(p);
+    return null;
+  }
+  async listPaymentsByStatus(status: Payment["status"], limit: number) {
+    return [...this.state.payments.values()].filter((p) => p.status === status)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit).map(clone);
+  }
   async getPaymentByReference(reference: string) {
     for (const p of this.state.payments.values()) if (p.reference === reference) return clone(p);
     return null;
@@ -189,6 +206,8 @@ export class MemoryStore implements Store {
       .filter((e) => (!f.orderId || e.orderId === f.orderId) && (!f.account || e.account === f.account))
       .slice(-(f.limit ?? 500)).map(clone);
   }
+  /** Transactions are already serialized by the store-wide lock. */
+  async lockAccount(_account: string) {}
   async accountBalance(account: string) {
     let b = 0n;
     for (const e of this.state.ledger) {
@@ -209,6 +228,12 @@ export class MemoryStore implements Store {
     for (const x of this.state.refunds.values()) if (x.orderId === r.orderId) throw conflict("refund_exists", "Order already refunded");
     this.state.refunds.set(r.id, clone(r));
     return clone(r);
+  }
+  async getRefund(id: string) { return clone(this.state.refunds.get(id) ?? null); }
+  async listRefundsByStatus(statuses: Refund["status"][], olderThan: Date, limit: number) {
+    return [...this.state.refunds.values()]
+      .filter((r) => statuses.includes(r.status) && r.createdAt.getTime() <= olderThan.getTime())
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()).slice(0, limit).map(clone);
   }
   async getRefundByOrder(orderId: string) {
     for (const r of this.state.refunds.values()) if (r.orderId === orderId) return clone(r);

@@ -1,11 +1,12 @@
 import type { Server as HttpServer } from "node:http";
+import jwt from "jsonwebtoken";
 import { Server, type Socket } from "socket.io";
 import { z } from "zod";
 import type { Container } from "../container";
 import { HttpError } from "../errors";
 import type { User } from "../types";
 import type { Publisher } from "./events";
-import { room } from "./events";
+import { SESSION_REVOKED, room } from "./events";
 
 export interface Realtime {
   publish: Publisher;
@@ -20,7 +21,12 @@ export function createRealtime(): Realtime {
   let io: Server | null = null;
   return {
     publish: (m) => {
-      if (io) io.to(m.rooms).emit(m.event, m.data);
+      if (!io) return;
+      if (m.event === SESSION_REVOKED) {
+        io.in(m.rooms).disconnectSockets(true); // adapter-aware, so it also reaches other instances
+        return;
+      }
+      io.to(m.rooms).emit(m.event, m.data);
     },
     attach(http, c, opts) {
       io = new Server(http, {
@@ -34,7 +40,12 @@ export function createRealtime(): Realtime {
         const token = (socket.handshake.auth as { token?: unknown } | undefined)?.token;
         if (typeof token !== "string" || token.length === 0) return next(new Error("unauthorized"));
         c.auth.authenticate(token).then(
-          (user) => { socket.data.user = user; next(); },
+          (user) => {
+            socket.data.user = user;
+            const exp = (jwt.decode(token) as { exp?: number } | null)?.exp;
+            socket.data.expiresAtMs = typeof exp === "number" ? exp * 1000 : Date.now();
+            next();
+          },
           (err: unknown) => next(new Error(err instanceof HttpError && err.status === 403 ? "forbidden" : "unauthorized")),
         );
       });
@@ -49,12 +60,17 @@ export function createRealtime(): Realtime {
 
 async function onConnect(socket: Socket, c: Container): Promise<void> {
   const user = socket.data.user as User;
+  // Authorization is checked at handshake, so end the session when the token expires.
+  const remaining = Math.min(Math.max((socket.data.expiresAtMs as number) - Date.now(), 0), 2 ** 31 - 1);
+  const expiry = setTimeout(() => socket.disconnect(true), remaining);
+  socket.on("disconnect", () => clearTimeout(expiry));
+  await socket.join(room.user(user.id));
   // Base rooms are derived from identity on the server. Clients cannot choose them.
   if (user.role === "CUSTOMER") await socket.join(room.customer(user.id));
   if (user.role === "ADMIN") await socket.join(room.admin);
   if (user.role === "VENDOR") {
     const v = await c.store.getVendorByOwner(user.id);
-    if (v) await socket.join(room.vendor(v.id));
+    if (v?.status === "APPROVED") await socket.join(room.vendor(v.id));
   }
   if (user.role === "COURIER") {
     await socket.join(room.courier(user.id));

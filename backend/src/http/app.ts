@@ -7,6 +7,7 @@ import pinoHttp from "pino-http";
 import { ZodError, z } from "zod";
 import type { Container } from "../container";
 import { HttpError, badRequest, conflict, forbidden, notFound, unauthorized } from "../errors";
+import { SESSION_REVOKED, room } from "../realtime/events";
 import { acct, payoutLines, post } from "../services/ledger";
 import type { Role, User } from "../types";
 
@@ -187,6 +188,8 @@ export function createApp(c: Container): express.Express {
   const adminOnly = [authenticate, requireRole("ADMIN")];
   const audit = (actor: User, action: string, entityType: string, entityId: string, metadata: Record<string, unknown> = {}) =>
     c.store.addAudit({ id: randomUUID(), actorId: actor.id, action, entityType, entityId, metadata, createdAt: c.clock.now() });
+  /** Asks the realtime layer to drop every live socket of this user so room events stop at once. */
+  const revokeSessions = (userId: string) => c.publish({ rooms: [room.user(userId)], event: SESSION_REVOKED, data: {} });
   const statusParam = z.enum(["PENDING", "APPROVED", "SUSPENDED"]).optional();
 
   app.get("/api/admin/vendors", ...adminOnly, wrap(async (req, res) => {
@@ -200,12 +203,14 @@ export function createApp(c: Container): express.Express {
       const v = await c.store.setVendorStatus(idParam(req), status);
       if (!v) throw notFound("Vendor");
       await audit(me(req), `vendor.${action}`, "vendor", v.id);
+      if (status === "SUSPENDED") revokeSessions(v.ownerId);
       res.json({ vendor: v });
     }));
     app.post(`/api/admin/couriers/:id/${action}`, ...adminOnly, wrap(async (req, res) => {
       const co = await c.store.setCourierStatus(idParam(req), status);
       if (!co) throw notFound("Courier");
       await audit(me(req), `courier.${action}`, "courier", co.id);
+      if (status === "SUSPENDED") revokeSessions(co.userId);
       res.json({ courier: co });
     }));
   }
@@ -219,6 +224,13 @@ export function createApp(c: Container): express.Express {
     res.json({ entries: await c.store.listLedger(q), trialBalance: { debitsKobo: tb.debits.toString(), creditsKobo: tb.credits.toString(), balanced: tb.debits === tb.credits } });
   }));
   app.get("/api/admin/refunds", ...adminOnly, wrap(async (_req, res) => { res.json({ refunds: await c.store.listRefunds(200) }); }));
+  app.post("/api/admin/refunds/:id/retry", ...adminOnly, wrap(async (req, res) => {
+    res.json({ refund: await c.orders.adminRetryRefund(me(req), idParam(req)) });
+  }));
+  // Charges whose amount or currency did not match the order. The money is held at the gateway and needs an operator.
+  app.get("/api/admin/payments/mismatched", ...adminOnly, wrap(async (_req, res) => {
+    res.json({ payments: await c.store.listPaymentsByStatus("MISMATCH", 200) });
+  }));
   app.get("/api/admin/audit", ...adminOnly, wrap(async (_req, res) => { res.json({ audit: await c.store.listAudit(200) }); }));
   app.get("/api/admin/system", ...adminOnly, wrap(async (_req, res) => {
     const tb = await c.store.trialBalance();
@@ -236,6 +248,7 @@ export function createApp(c: Container): express.Express {
     const account = b.kind === "VENDOR" ? acct.vendor(b.ownerId) : acct.courier(b.ownerId);
     const admin = me(req);
     await c.store.tx(async (s) => {
+      await s.lockAccount(account); // serialize concurrent payouts from the same account
       const balance = await s.accountBalance(account);
       if (balance < BigInt(b.amountKobo)) throw conflict("insufficient_balance", "Payable balance is lower than the payout amount");
       await post(s, null, payoutLines(account, b.amountKobo), c.clock.now());

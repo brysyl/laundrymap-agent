@@ -39,6 +39,7 @@ const schema = z.object({
   GATEWAY_CAP_KOBO: intStr(200000),
   VENDOR_ACCEPT_TIMEOUT_MS: intStr(120000),
   WORKER_INTERVAL_MS: intStr(5000),
+  REFUND_RETRY_MIN_AGE_MS: intStr(60000),
   OTP_TTL_MS: intStr(6 * 3600 * 1000),
   OTP_MAX_ATTEMPTS: intStr(5),
   OTP_LOCK_MS: intStr(15 * 60 * 1000),
@@ -73,6 +74,7 @@ export interface Config {
   gatewayCapKobo: number;
   vendorAcceptTimeoutMs: number;
   workerIntervalMs: number;
+  refundRetryMinAgeMs: number;
   otpTtlMs: number;
   otpMaxAttempts: number;
   otpLockMs: number;
@@ -172,6 +174,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     gatewayCapKobo: e.GATEWAY_CAP_KOBO,
     vendorAcceptTimeoutMs: e.VENDOR_ACCEPT_TIMEOUT_MS,
     workerIntervalMs: e.WORKER_INTERVAL_MS,
+    refundRetryMinAgeMs: e.REFUND_RETRY_MIN_AGE_MS,
     otpTtlMs: e.OTP_TTL_MS,
     otpMaxAttempts: e.OTP_MAX_ATTEMPTS,
     otpLockMs: e.OTP_LOCK_MS,

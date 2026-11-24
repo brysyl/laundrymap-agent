@@ -27,4 +27,9 @@ describe("001_init.sql (static)", () => {
     expect(sql).not.toMatch(/\b(float|double precision|real|numeric|decimal)\b/i);
     expect(sql).toMatch(/amount_kobo\s+bigint/);
   });
+  it("002 enforces one pending payment per order and indexes unsettled refunds", () => {
+    const m2 = readFileSync(path.resolve(__dirname, "../migrations/002_payment_and_refund_hardening.sql"), "utf8");
+    expect(m2).toMatch(/CREATE UNIQUE INDEX payments_one_pending_per_order ON payments \(order_id\) WHERE status = 'PENDING'/);
+    expect(m2).toMatch(/refunds_unsettled_idx/);
+  });
 });

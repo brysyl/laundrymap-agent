@@ -9,7 +9,10 @@ export interface QueuedRequest {
   method: "POST" | "PUT" | "PATCH" | "DELETE";
   path: string;
   body?: unknown;
+  /** Client-side dedupe key. It is not sent to the server, which has no idempotency-key support. */
   idempotencyKey: string;
+  /** The user who queued the request. Items never replay under a different user. */
+  userId: string;
   attempts: number;
   createdAt: number;
 }
@@ -17,6 +20,7 @@ export interface QueuedRequest {
 export interface QueueStorage {
   getItem(k: string): string | null;
   setItem(k: string, v: string): void;
+  removeItem?(k: string): void;
 }
 
 export type Sender = (r: QueuedRequest) => Promise<{ status: number }>;
@@ -40,7 +44,7 @@ export function backoffMs(attempts: number, base = 1000, cap = 60_000): number {
 }
 
 export const MAX_ATTEMPTS = 6;
-const STORAGE_KEY = "laundrymap.retryQueue.v1";
+export const QUEUE_STORAGE_KEY = "laundrymap.retryQueue.v1";
 
 export class RetryQueue {
   private items: QueuedRequest[] = [];
@@ -71,12 +75,31 @@ export class RetryQueue {
     return true;
   }
 
-  /** Sends queued requests in order. Stops at the first retryable failure. */
-  async flush(): Promise<{ sent: number; dropped: number; remaining: number }> {
+  /** Forgets every queued request, in memory and in storage. Call on sign-out. */
+  clear(): void {
+    this.items = [];
+    try {
+      this.storage?.removeItem?.(QUEUE_STORAGE_KEY);
+    } catch {
+      /* storage unavailable */
+    }
+  }
+
+  /**
+   * Sends queued requests in order. Stops at the first retryable failure.
+   * When `currentUserId` is given, requests queued by anyone else are discarded unsent.
+   */
+  async flush(currentUserId?: string | null): Promise<{ sent: number; dropped: number; remaining: number }> {
     if (this.flushing) return { sent: 0, dropped: 0, remaining: this.items.length };
+    let foreign = 0;
+    if (currentUserId !== undefined) {
+      const mine = this.items.filter((i) => i.userId === currentUserId);
+      foreign = this.items.length - mine.length;
+      if (foreign > 0) { this.items = mine; this.persist(); }
+    }
     this.flushing = true;
     let sent = 0;
-    let dropped = 0;
+    let dropped = foreign;
     try {
       while (this.items.length > 0) {
         const head = this.items[0]!;
@@ -110,9 +133,9 @@ export class RetryQueue {
 
   private load(): void {
     try {
-      const raw = this.storage?.getItem(STORAGE_KEY);
+      const raw = this.storage?.getItem(QUEUE_STORAGE_KEY);
       const parsed: unknown = raw ? JSON.parse(raw) : [];
-      if (Array.isArray(parsed)) this.items = parsed.filter((i): i is QueuedRequest => !!i && typeof i.path === "string" && isQueueable(i.method, i.path));
+      if (Array.isArray(parsed)) this.items = parsed.filter((i): i is QueuedRequest => !!i && typeof i.path === "string" && typeof i.userId === "string" && isQueueable(i.method, i.path));
     } catch {
       this.items = [];
     }
@@ -120,7 +143,7 @@ export class RetryQueue {
 
   private persist(): void {
     try {
-      this.storage?.setItem(STORAGE_KEY, JSON.stringify(this.items));
+      this.storage?.setItem(QUEUE_STORAGE_KEY, JSON.stringify(this.items));
     } catch {
       /* storage full or unavailable: queue stays in memory */
     }

@@ -146,10 +146,21 @@ export class OrderService {
     const { authorizationUrl } = await this.d.gateway.initialize({
       email: customer.email, amountKobo: order.totalKobo, reference, callbackUrl: this.d.config.paystackCallbackUrl, orderId: order.id,
     });
-    await this.d.store.createPayment({
-      id: randomUUID(), orderId: order.id, reference, amountKobo: order.totalKobo, status: "PENDING",
-      authorizationUrl, gatewayTransactionId: null, paidAt: null, createdAt: this.d.clock.now(),
-    });
+    try {
+      await this.d.store.createPayment({
+        id: randomUUID(), orderId: order.id, reference, amountKobo: order.totalKobo, status: "PENDING",
+        authorizationUrl, gatewayTransactionId: null, paidAt: null, createdAt: this.d.clock.now(),
+      });
+    } catch (err) {
+      // A concurrent call won the unique pending-payment slot. Return its reference so the customer pays only one.
+      if (err instanceof HttpError && err.code === "payment_pending") {
+        const winner = await this.d.store.getPaymentByOrder(id);
+        if (winner && winner.status === "PENDING" && winner.authorizationUrl) {
+          return { reference: winner.reference, authorizationUrl: winner.authorizationUrl };
+        }
+      }
+      throw err;
+    }
     return { reference, authorizationUrl };
   }
 
@@ -313,8 +324,8 @@ export class OrderService {
 
   private async refundInTx(s: Store, order: Order, from: OrderStatus[], kind: RefundKind, reason: string, actorId: string | null) {
     const now = this.d.clock.now();
-    const payment = await s.getPaymentByOrder(order.id);
-    if (!payment || payment.status !== "PAID") throw conflict("not_paid", "Order has no confirmed payment");
+    const payment = await s.getPaidPaymentByOrder(order.id);
+    if (!payment) throw conflict("not_paid", "Order has no confirmed payment");
     const updated = await s.transitionOrder(order.id, from, { status: "REFUNDED", cancelReason: reason }, now);
     if (!updated) throw conflict("invalid_state", "Order state changed, refund not applied");
     await post(s, order.id, refundLines(order, payment.amountKobo, reason), now);
@@ -329,16 +340,46 @@ export class OrderService {
     return { order: updated, refund };
   }
 
-  private async submitRefund(refund: Refund): Promise<void> {
-    const payment = await this.d.store.getPaymentByOrder(refund.orderId);
-    if (!payment) return;
+  /** Submits a RECORDED or FAILED refund to the gateway. Returns the resulting status. */
+  async submitRefund(refund: Refund): Promise<Refund["status"]> {
+    const payment = await this.d.store.getPayment(refund.paymentId);
+    if (!payment) return refund.status;
     try {
       const r = await this.d.gateway.refund({ reference: payment.reference, amountKobo: refund.amountKobo });
       await this.d.store.updateRefund(refund.id, { status: "SUBMITTED", gatewayRef: r.gatewayRef });
+      return "SUBMITTED";
     } catch (err) {
       await this.d.store.updateRefund(refund.id, { status: "FAILED" });
-      this.d.logger.error({ err, refundId: refund.id, orderId: refund.orderId }, "gateway refund submission failed; ledger entry is recorded, retry needed");
+      this.d.logger.error({ err, refundId: refund.id, orderId: refund.orderId }, "gateway refund submission failed; the worker will retry");
+      return "FAILED";
     }
+  }
+
+  /**
+   * Worker sweep: re-submits refunds that are FAILED, or RECORDED because the process died
+   * before the gateway call. Refunds younger than `refundRetryMinAgeMs` are skipped so a
+   * request that is still submitting is not raced. Returns the number now SUBMITTED.
+   */
+  async retryRefunds(): Promise<number> {
+    const cutoff = new Date(this.d.clock.now().getTime() - this.d.config.refundRetryMinAgeMs);
+    const due = await this.d.store.listRefundsByStatus(["RECORDED", "FAILED"], cutoff, 50);
+    let n = 0;
+    for (const r of due) if ((await this.submitRefund(r)) === "SUBMITTED") n++;
+    return n;
+  }
+
+  /** Admin retry of one unsettled refund. */
+  async adminRetryRefund(admin: User, refundId: string): Promise<Refund> {
+    if (admin.role !== "ADMIN") throw forbidden();
+    const refund = await this.d.store.getRefund(refundId);
+    if (!refund) throw notFound("Refund");
+    if (refund.status === "SUBMITTED") throw conflict("already_submitted", "Refund was already submitted to the gateway");
+    await this.submitRefund(refund);
+    await this.d.store.addAudit({
+      id: randomUUID(), actorId: admin.id, action: "refund.retry", entityType: "refund", entityId: refund.id,
+      metadata: { orderId: refund.orderId }, createdAt: this.d.clock.now(),
+    });
+    return (await this.d.store.getRefund(refundId)) as Refund;
   }
 
   private async refundAndPublish(order: Order, from: OrderStatus[], kind: RefundKind, reason: string, actorId: string | null): Promise<Order> {

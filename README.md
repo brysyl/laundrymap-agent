@@ -120,10 +120,17 @@ Socket.IO rooms are derived from the authenticated identity on the server. A cli
 
 Known limitations:
 
-- The backend does not implement an `Idempotency-Key` header. Duplicate Paystack webhook deliveries are deduplicated by event id and payment reference, not by a client key.
-- The `PostgresStore` payout balance check does not take a row lock, so two concurrent payouts could both pass the balance check. Do not run concurrent admin payouts until a lock is added.
+- The backend does not implement an `Idempotency-Key` header, and the frontend no longer sends one. Duplicate Paystack webhook deliveries are deduplicated by event id and payment reference. Replayed vendor and courier actions are made safe by compare-and-set on order status (a replay returns 409, which the offline queue treats as final).
+- Refunds are recorded in the ledger first and submitted to Paystack afterwards. The worker re-submits refunds that are `FAILED` or stuck in `RECORDED` once they are `REFUND_RETRY_MIN_AGE_MS` old (default 60 seconds), at the worker interval. There is no per-refund backoff or attempt cap, and two API instances can submit the same refund at once (Paystack rejects a second full refund). Admins can retry one refund with `POST /api/admin/refunds/:id/retry`. The ledger does not yet record gateway-side completion, so `payable:customer_refunds` only grows.
+- A charge whose amount or currency differs from the order is not applied and the order stays `PENDING_PAYMENT`. These payments are listed at `GET /api/admin/payments/mismatched`, and the money is refunded by an operator in the Paystack dashboard. There is no automated refund for them.
+- Payouts take a per-account Postgres advisory lock (`lockAccount`) before checking the balance. This path is covered by a Postgres integration test that has not been run in this repository's development environment (see below).
+- Postgres tests live in `backend/tests/postgres.integration.test.ts` and run only when `TEST_DATABASE_URL` points at a PostGIS database. CI provides one. Without it they are skipped, and all other backend tests use the in-memory store. Treat the Postgres store, ledger triggers and migration 002 as unverified until CI has run them.
+- Suspending a vendor or courier disconnects their live sockets, sockets end when their JWT expires, and vendor and courier rooms are joined only when approved. Other changes (for example a user account status change) are only checked at connect and on `order:join`. There is no admin endpoint that suspends a user account.
+- The JWT is stored in `localStorage`, and the production CSP still allows `'unsafe-inline'` scripts (Next.js needs it without per-request nonces). An XSS bug would expose a 12 hour bearer token. Moving to an httpOnly cookie or a nonce-based CSP needs dynamic rendering and cross-origin cookie work that is not done.
+- The offline retry queue is tagged with the user id and cleared on sign-out and on a 401 response. A flush also discards items queued by a different user.
+- The courier delivery flow consumes the OTP before the `DELIVERED` transition commits. A refund landing in that window burns the code on an order that is not delivered.
 - The rate limiter keeps counters in process memory, so limits are per instance and reset on restart.
-- The timeout sweeper runs inside each API process. There is no separate worker service.
+- The timeout and refund sweeps run inside each API process. There is no separate worker service.
 
 ## Deployment
 
@@ -143,8 +150,8 @@ Nothing below has been completed. Tick each item in staging before go-live.
 6. DNS and SSL: `laundrymap.ng` (Vercel) and `api.laundrymap.ng` (Render) with valid certificates. Set `CORS_EXTRA_ORIGINS` only if extra https origins are needed, `NEXT_PUBLIC_API_URL=https://api.laundrymap.ng`, and `TRUST_PROXY=1`.
 7. Set `SEED_DEMO=false`. Create the first admin through `ADMIN_EMAIL`, `ADMIN_PHONE` and `ADMIN_PASSWORD`, then remove the password variable.
 8. Build the Docker image (`docker build -f backend/Dockerfile .`) and confirm the container passes its health check.
-9. Add a row lock to the `PostgresStore` payout balance check, or restrict payouts to one admin at a time.
-10. Decide whether to add `Idempotency-Key` support and a shared (Redis) rate limiter before running more than one API instance.
+9. Confirm the Postgres integration tests (`TEST_DATABASE_URL`) pass in CI, including concurrent payouts and the one-pending-payment index. Migration 002 fails if existing data already has two `PENDING` payments for one order.
+10. Decide whether to move the JWT to an httpOnly cookie and add a shared (Redis) rate limiter before running more than one API instance. Check the mismatched-payments list (`/api/admin/payments/mismatched`) and failed refunds (`/api/admin/refunds`) daily.
 11. Run a Lighthouse PWA audit against the deployed site and test install, offline mode and live order updates on a real Android device and an iPhone.
 
 ## License

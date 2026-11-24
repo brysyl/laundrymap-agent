@@ -216,12 +216,25 @@ export class PostgresStore implements Store {
   }
 
   async createPayment(p: Payment) {
-    await this.q.query(
-      `INSERT INTO payments (id,order_id,reference,amount_kobo,status,authorization_url,gateway_transaction_id,paid_at,created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [p.id, p.orderId, p.reference, p.amountKobo, p.status, p.authorizationUrl, p.gatewayTransactionId, p.paidAt, p.createdAt],
-    );
+    try {
+      await this.q.query(
+        `INSERT INTO payments (id,order_id,reference,amount_kobo,status,authorization_url,gateway_transaction_id,paid_at,created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [p.id, p.orderId, p.reference, p.amountKobo, p.status, p.authorizationUrl, p.gatewayTransactionId, p.paidAt, p.createdAt],
+      );
+    } catch (e) {
+      if (isUnique(e) && e.constraint === "payments_one_pending_per_order") throw conflict("payment_pending", "Order already has a pending payment");
+      throw e;
+    }
     return p;
+  }
+  async getPayment(id: string) { const r = await this.one("SELECT * FROM payments WHERE id=$1", [id]); return r ? paymentOf(r) : null; }
+  async getPaidPaymentByOrder(orderId: string) {
+    const r = await this.one("SELECT * FROM payments WHERE order_id=$1 AND status='PAID' ORDER BY paid_at LIMIT 1", [orderId]);
+    return r ? paymentOf(r) : null;
+  }
+  async listPaymentsByStatus(status: Payment["status"], limit: number) {
+    return (await this.rows("SELECT * FROM payments WHERE status=$1 ORDER BY created_at DESC LIMIT $2", [status, limit])).map(paymentOf);
   }
   async getPaymentByReference(reference: string) { const r = await this.one("SELECT * FROM payments WHERE reference=$1", [reference]); return r ? paymentOf(r) : null; }
   async getPaymentByOrder(orderId: string) { const r = await this.one("SELECT * FROM payments WHERE order_id=$1 ORDER BY created_at DESC LIMIT 1", [orderId]); return r ? paymentOf(r) : null; }
@@ -258,6 +271,10 @@ export class PostgresStore implements Store {
     );
     return rows.map(ledgerOf);
   }
+  async lockAccount(account: string) {
+    // Transaction-scoped. Under READ COMMITTED the balance read that follows sees every commit made before the lock was granted.
+    await this.q.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`ledger-account:${account}`]);
+  }
   async accountBalance(account: string) {
     const r = await this.one(
       "SELECT COALESCE(SUM(CASE WHEN direction='CREDIT' THEN amount_kobo ELSE -amount_kobo END),0)::text AS bal FROM ledger_entries WHERE account=$1",
@@ -285,6 +302,13 @@ export class PostgresStore implements Store {
       throw e;
     }
     return r;
+  }
+  async getRefund(id: string) { const r = await this.one("SELECT * FROM refunds WHERE id=$1", [id]); return r ? refundOf(r) : null; }
+  async listRefundsByStatus(statuses: Refund["status"][], olderThan: Date, limit: number) {
+    return (await this.rows(
+      "SELECT * FROM refunds WHERE status = ANY($1::text[]) AND created_at <= $2 ORDER BY created_at LIMIT $3",
+      [statuses, olderThan, limit],
+    )).map(refundOf);
   }
   async getRefundByOrder(orderId: string) { const r = await this.one("SELECT * FROM refunds WHERE order_id=$1", [orderId]); return r ? refundOf(r) : null; }
   async updateRefund(id: string, patch: Partial<Pick<Refund, "status" | "gatewayRef">>) {

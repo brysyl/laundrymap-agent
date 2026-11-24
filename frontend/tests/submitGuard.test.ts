@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { SubmitGuard } from "../src/lib/submitGuard";
-import { MAX_ATTEMPTS, RetryQueue, backoffMs, isQueueable, shouldRetryStatus, type QueueStorage } from "../src/lib/retryQueue";
+import { MAX_ATTEMPTS, QUEUE_STORAGE_KEY, RetryQueue, backoffMs, isQueueable, shouldRetryStatus, type QueueStorage } from "../src/lib/retryQueue";
 import { canApplyUpdate } from "../src/lib/swPolicy";
 
 const ID = "11111111-1111-4111-8111-111111111111";
 const memStorage = (): QueueStorage & { data: Map<string, string> } => {
   const data = new Map<string, string>();
-  return { data, getItem: (k) => data.get(k) ?? null, setItem: (k, v) => { data.set(k, v); } };
+  return { data, getItem: (k) => data.get(k) ?? null, setItem: (k, v) => { data.set(k, v); }, removeItem: (k) => { data.delete(k); } };
 };
 
 describe("SubmitGuard", () => {
@@ -57,7 +57,7 @@ describe("RetryQueue", () => {
     }
     expect(isQueueable("GET", `/api/vendor/orders/${ID}/accept`)).toBe(false);
     const q = new RetryQueue(async () => ({ status: 200 }));
-    expect(q.enqueue({ id: "1", method: "POST", path: `/api/orders/${ID}/pay`, idempotencyKey: "k" })).toBe(false);
+    expect(q.enqueue({ id: "1", method: "POST", path: `/api/orders/${ID}/pay`, idempotencyKey: "k", userId: "u1" })).toBe(false);
     expect(q.size).toBe(0);
   });
 
@@ -65,9 +65,9 @@ describe("RetryQueue", () => {
     const st = memStorage(); const sent: string[] = [];
     const q = new RetryQueue(async (r) => { sent.push(r.path); return { status: 200 }; }, st);
     const p1 = `/api/vendor/orders/${ID}/accept`; const p2 = `/api/courier/orders/${ID}/claim`;
-    q.enqueue({ id: "a", method: "POST", path: p1, idempotencyKey: "k1" });
-    q.enqueue({ id: "a2", method: "POST", path: p1, idempotencyKey: "k1b" }); // same action, ignored
-    q.enqueue({ id: "b", method: "POST", path: p2, idempotencyKey: "k2" });
+    q.enqueue({ id: "a", method: "POST", path: p1, idempotencyKey: "k1", userId: "u1" });
+    q.enqueue({ id: "a2", method: "POST", path: p1, idempotencyKey: "k1b", userId: "u1" }); // same action, ignored
+    q.enqueue({ id: "b", method: "POST", path: p2, idempotencyKey: "k2", userId: "u1" });
     expect(q.size).toBe(2);
     expect(new RetryQueue(async () => ({ status: 200 }), st).size).toBe(2); // reload from storage
     expect(await q.flush()).toEqual({ sent: 2, dropped: 0, remaining: 0 });
@@ -77,7 +77,7 @@ describe("RetryQueue", () => {
   it("keeps the request on network error or 5xx and drops on final 4xx", async () => {
     let mode: "throw" | 503 | 409 = "throw";
     const q = new RetryQueue(async () => { if (mode === "throw") throw new Error("offline"); return { status: mode }; });
-    q.enqueue({ id: "a", method: "POST", path: `/api/vendor/orders/${ID}/accept`, idempotencyKey: "k" });
+    q.enqueue({ id: "a", method: "POST", path: `/api/vendor/orders/${ID}/accept`, idempotencyKey: "k", userId: "u1" });
     expect((await q.flush()).remaining).toBe(1);
     mode = 503; expect((await q.flush()).remaining).toBe(1);
     expect(q.snapshot()[0]!.attempts).toBe(2);
@@ -86,15 +86,45 @@ describe("RetryQueue", () => {
 
   it("gives up after MAX_ATTEMPTS", async () => {
     const q = new RetryQueue(async () => ({ status: 500 }));
-    q.enqueue({ id: "a", method: "POST", path: `/api/vendor/orders/${ID}/accept`, idempotencyKey: "k" });
+    q.enqueue({ id: "a", method: "POST", path: `/api/vendor/orders/${ID}/accept`, idempotencyKey: "k", userId: "u1" });
     let last = { sent: 0, dropped: 0, remaining: 1 };
     for (let i = 0; i < MAX_ATTEMPTS; i++) last = await q.flush();
     expect(last).toEqual({ sent: 0, dropped: 1, remaining: 0 });
   });
 
+  it("clear() empties the queue and its storage so nothing replays after sign-out", async () => {
+    const st = memStorage(); const sent: string[] = [];
+    const q = new RetryQueue(async (r) => { sent.push(r.path); return { status: 200 }; }, st);
+    q.enqueue({ id: "a", method: "POST", path: `/api/vendor/orders/${ID}/accept`, idempotencyKey: "k", userId: "u1" });
+    expect(st.data.has(QUEUE_STORAGE_KEY)).toBe(true);
+    q.clear();
+    expect(q.size).toBe(0);
+    expect(st.data.has(QUEUE_STORAGE_KEY)).toBe(false);
+    expect(new RetryQueue(async () => ({ status: 200 }), st).size).toBe(0);
+    await q.flush();
+    expect(sent).toEqual([]);
+  });
+
+  it("never replays another user's queued requests", async () => {
+    const st = memStorage(); const sent: string[] = [];
+    const q = new RetryQueue(async (r) => { sent.push(r.userId); return { status: 200 }; }, st);
+    q.enqueue({ id: "a", method: "POST", path: `/api/vendor/orders/${ID}/accept`, idempotencyKey: "k1", userId: "alice" });
+    q.enqueue({ id: "b", method: "POST", path: `/api/courier/orders/${ID}/claim`, idempotencyKey: "k2", userId: "bob" });
+    expect(await q.flush("bob")).toEqual({ sent: 1, dropped: 1, remaining: 0 });
+    expect(sent).toEqual(["bob"]);
+    q.enqueue({ id: "c", method: "POST", path: `/api/vendor/orders/${ID}/start`, idempotencyKey: "k3", userId: "alice" });
+    expect(await q.flush(null)).toEqual({ sent: 0, dropped: 1, remaining: 0 });
+  });
+
+  it("drops stored entries that have no user id", () => {
+    const st = memStorage();
+    st.setItem(QUEUE_STORAGE_KEY, JSON.stringify([{ id: "x", method: "POST", path: `/api/vendor/orders/${ID}/accept`, idempotencyKey: "k", attempts: 0, createdAt: 0 }]));
+    expect(new RetryQueue(async () => ({ status: 200 }), st).size).toBe(0);
+  });
+
   it("ignores tampered stored entries", () => {
     const st = memStorage();
-    st.setItem("laundrymap.retryQueue.v1", JSON.stringify([{ id: "x", method: "POST", path: "/api/admin/payouts", idempotencyKey: "k", attempts: 0, createdAt: 0 }]));
+    st.setItem("laundrymap.retryQueue.v1", JSON.stringify([{ id: "x", method: "POST", path: "/api/admin/payouts", idempotencyKey: "k", userId: "u1", attempts: 0, createdAt: 0 }]));
     expect(new RetryQueue(async () => ({ status: 200 }), st).size).toBe(0);
   });
 
