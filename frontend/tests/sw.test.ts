@@ -107,3 +107,20 @@ describe("sw.js behavior with fake globals", () => {
     expect(fire(ORIGIN + "/customer", "GET", "navigate")).toBe(true);
   });
 });
+
+describe("service worker offline fallback behavior", () => {
+  const sw = readFileSync(join(__dirname, "../public/sw.js"), "utf8");
+  it("navigation handler tries the network first and falls back to the cached /offline page", () => {
+    const fn = sw.slice(sw.indexOf("async function navigate"), sw.indexOf('self.addEventListener("fetch"'));
+    expect(fn.indexOf("await fetch(request)")).toBeGreaterThan(-1);
+    expect(fn.indexOf("catch")).toBeGreaterThan(fn.indexOf("await fetch(request)"));
+    expect(fn).toContain("R.OFFLINE_URL");
+    expect(fn).not.toMatch(/cache\.put/); // navigation HTML is never stored
+  });
+  it("precaches the offline URL and /api is never cache-first or swr", () => {
+    expect(R.PRECACHE_URLS).toContain(R.OFFLINE_URL);
+    for (const m of ["GET", "HEAD", "PUT", "PATCH", "DELETE", "POST"]) {
+      expect(["cache-first", "stale-while-revalidate", "navigate"]).not.toContain(cls("/api/orders", m));
+    }
+  });
+});

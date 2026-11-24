@@ -180,4 +180,33 @@ d("PostgresStore against a live database", () => {
     expect(await s.getRefund(r.id)).toMatchObject({ status: "EXHAUSTED", nextAttemptAt: null, lastError: null });
     expect(await s.claimRefund(r.id, now(), lease, { maxAttempts: 2, force: true })).toMatchObject({ status: "SUBMITTING" });
   });
+
+  it("re-running migrations is a no-op and records every migration file once", async () => {
+    expect(await migrate(pool)).toEqual([]);
+    const { rows } = await pool.query<{ name: string }>("SELECT name FROM schema_migrations ORDER BY name");
+    expect(rows.map((r) => r.name)).toEqual(expect.arrayContaining(["001_init.sql", "002_payment_and_refund_hardening.sql", "003_refund_claims_and_mismatch_resolution.sql"]));
+    expect(new Set(rows.map((r) => r.name)).size).toBe(rows.length);
+  });
+
+  it("creates the expected tables and indexes from migrations 001-003", async () => {
+    const t = await pool.query<{ table_name: string }>("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()");
+    const tables = t.rows.map((r) => r.table_name);
+    for (const n of ["users", "vendors", "couriers", "orders", "order_items", "payments", "webhook_events", "ledger_entries", "refunds", "audit_logs", "otps"]) expect(tables).toContain(n);
+    const i = await pool.query<{ indexname: string }>("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()");
+    const idx = i.rows.map((r) => r.indexname);
+    expect(idx).toContain("payments_one_pending_per_order");
+    expect(idx).toContain("refunds_unsettled_idx");
+  });
+
+  it("keeps the whole-database ledger balanced when summed in SQL", async () => {
+    const s = store();
+    const account = `test:${randomUUID()}`;
+    await post(s, null, [
+      { account, direction: "DEBIT", amountKobo: 77, type: "PAYOUT", memo: "t" },
+      { account: acct.payouts, direction: "CREDIT", amountKobo: 77, type: "PAYOUT", memo: "t" },
+    ], now());
+    const r = await pool.query<{ d: string; c: string }>(
+      "SELECT COALESCE(SUM(amount_kobo) FILTER (WHERE direction = 'DEBIT'), 0) AS d, COALESCE(SUM(amount_kobo) FILTER (WHERE direction = 'CREDIT'), 0) AS c FROM ledger_entries");
+    expect(r.rows[0]!.d).toBe(r.rows[0]!.c);
+  });
 });

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -41,5 +41,25 @@ describe("001_init.sql (static)", () => {
     expect(m3).toMatch(/UNIQUE \(payment_id\)/);
     expect(m3).toMatch(/'MISMATCH_REFUNDED'/);
     expect(m3).toMatch(/received_kobo bigint/);
+  });
+});
+
+describe("migration files (static, always run)", () => {
+  const dir = path.resolve(__dirname, "../migrations");
+  const files = readdirSync(dir).filter((f) => f.endsWith(".sql")).sort();
+
+  it("are numbered contiguously from 001 so lexical order is application order", () => {
+    expect(files.length).toBeGreaterThanOrEqual(3);
+    files.forEach((f, i) => expect(f.startsWith(String(i + 1).padStart(3, "0") + "_"), f).toBe(true));
+  });
+  it("later migrations never drop or recreate the ledger or webhook tables", () => {
+    for (const f of files.slice(1)) {
+      const t = readFileSync(path.join(dir, f), "utf8");
+      expect(t, f).not.toMatch(/DROP TABLE\s+(IF EXISTS\s+)?(ledger_entries|webhook_events)/i);
+      expect(t, f).not.toMatch(/CREATE TABLE\s+(ledger_entries|webhook_events)\b/i);
+    }
+  });
+  it("no migration uses floating point types for money", () => {
+    for (const f of files) expect(readFileSync(path.join(dir, f), "utf8"), f).not.toMatch(/\b(float|double precision|real|numeric|decimal)\b/i);
   });
 });
