@@ -1,0 +1,46 @@
+# Render Blueprint for the backend API. The frontend deploys to Vercel
+# (Root Directory: frontend). Secrets marked sync:false are entered in the
+# Render dashboard and are never committed.
+#
+# Not applied in the authoring sandbox. Review in a staging Render account first.
+#
+# The vendor-acceptance timeout sweeper (backend/src/worker.ts) runs inside the
+# API process on a WORKER_INTERVAL_MS timer. There is no separate worker
+# entry point, so no worker service is declared. The sweep is a no-op for
+# orders already expired, and running several API instances is a known
+# limitation until an advisory lock or a dedicated worker is added.
+services:
+  - type: web
+    name: laundrymap-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "1"
+      - key: DATABASE_URL
+        sync: false # managed Postgres+PostGIS URL, must include sslmode=require
+      - key: REDIS_URL
+        sync: false # managed Redis URL, must be rediss://
+      - key: JWT_SECRET
+        generateValue: true
+      - key: OTP_ENCRYPTION_KEY
+        generateValue: true
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_CALLBACK_URL
+        sync: false
+      - key: CORS_EXTRA_ORIGINS
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PHONE
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SEED_DEMO
+        value: "false"
