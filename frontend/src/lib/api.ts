@@ -51,7 +51,7 @@ export async function api<T>(path: string, o: RequestOptions = {}): Promise<T> {
   if (!res.ok) {
     if (res.status === 401 && tokenStore.get()) {
       tokenStore.clear();
-      if (typeof window !== "undefined" && window.location.pathname !== "/login") window.location.assign("/login");
+      if (typeof window !== "undefined" && !["/auth", "/login", "/register"].includes(window.location.pathname)) window.location.assign("/auth");
     }
     throw new ApiError(res.status, data.error ?? "error", data.message ?? data.error ?? `Request failed (${res.status})`);
   }

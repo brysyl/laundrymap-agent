@@ -1,24 +1,46 @@
-"use client";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useEffect } from "react";
-import { tokenStore } from "@/lib/api";
-import { HOME } from "@/components/Shell";
+import dynamic from "next/dynamic";
+import { authHref } from "@/lib/authRoutes";
+
+const DashboardLink = dynamic(() => import("@/components/DashboardLink"));
+
+const ROLES = [
+  { title: "Customer", text: "Find vendors near you, pay securely and track pickup and delivery in real time." },
+  { title: "Vendor", text: "List your laundry shop, receive paid orders and manage every step of the wash." },
+  { title: "Courier", text: "Pick up and deliver orders around Karu and Mararaba and confirm each handover with a code." },
+];
 
 export default function Home() {
-  const router = useRouter();
-  useEffect(() => {
-    const u = tokenStore.user();
-    if (u && tokenStore.get()) router.replace(HOME[u.role]);
-  }, [router]);
   return (
-    <main>
-      <h1>Laundry-Map</h1>
-      <p>Find laundry vendors near you in Karu and Mararaba, pay securely and track pickup and delivery.</p>
-      <div className="row">
-        <Link href="/login"><button>Sign in</button></Link>
-        <Link href="/login?mode=register"><button className="ghost">Create account</button></Link>
-      </div>
-    </main>
+    <>
+      <header className="site-header">
+        <div className="site-header-inner">
+          <Link href="/" className="brand">Laundry-Map</Link>
+          <nav className="row" aria-label="Account">
+            <Link href={authHref("login")} className="btn btn-ghost">Sign In</Link>
+            <Link href={authHref("register")} className="btn btn-primary">Get Started</Link>
+          </nav>
+        </div>
+      </header>
+      <main className="landing">
+        <section className="hero">
+          <h1 className="hero-title">Laundry day, handled.</h1>
+          <p className="hero-sub">Find trusted laundry vendors in Karu and Mararaba, pay securely and track pickup and delivery from your phone.</p>
+          <div className="row">
+            <Link href={authHref("register")} className="btn btn-primary btn-lg">Get Started</Link>
+            <Link href={authHref("login")} className="btn btn-ghost btn-lg">Sign In</Link>
+            <DashboardLink />
+          </div>
+        </section>
+        <section className="roles" aria-label="Who it is for">
+          {ROLES.map((r) => (
+            <article className="role-card" key={r.title}>
+              <h2>{r.title}</h2>
+              <p>{r.text}</p>
+            </article>
+          ))}
+        </section>
+      </main>
+    </>
   );
 }
