@@ -4,7 +4,7 @@ import type {
   ApprovalStatus, AuditLog, Courier, LedgerEntry, Order, OrderFilter, OrderItem, OrderPatch, OrderStatus,
   Otp, Payment, Refund, User, Vendor, VendorNearby,
 } from "../types";
-import type { Store, SystemCounts } from "./store";
+import type { RefundPatch, Store, SystemCounts } from "./store";
 
 type Q = Pool | PoolClient;
 type Row = QueryResultRow;
@@ -46,7 +46,8 @@ const itemOf = (r: Row): OrderItem => ({
   id: r.id, orderId: r.order_id, name: r.name, quantity: Number(r.quantity), unitPriceKobo: kobo(r.unit_price_kobo),
 });
 const paymentOf = (r: Row): Payment => ({
-  id: r.id, orderId: r.order_id, reference: r.reference, amountKobo: kobo(r.amount_kobo), status: r.status,
+  id: r.id, orderId: r.order_id, reference: r.reference, amountKobo: kobo(r.amount_kobo),
+  receivedKobo: r.received_kobo === null || r.received_kobo === undefined ? null : kobo(r.received_kobo), status: r.status,
   authorizationUrl: r.authorization_url, gatewayTransactionId: r.gateway_transaction_id, paidAt: dt(r.paid_at),
   createdAt: dreq(r.created_at),
 });
@@ -56,7 +57,8 @@ const ledgerOf = (r: Row): LedgerEntry => ({
 });
 const refundOf = (r: Row): Refund => ({
   id: r.id, orderId: r.order_id, paymentId: r.payment_id, amountKobo: kobo(r.amount_kobo), reason: r.reason,
-  kind: r.kind, status: r.status, requestedBy: r.requested_by, gatewayRef: r.gateway_ref, createdAt: dreq(r.created_at),
+  kind: r.kind, status: r.status, requestedBy: r.requested_by, gatewayRef: r.gateway_ref,
+  attempts: Number(r.attempts), nextAttemptAt: dt(r.next_attempt_at), lastError: r.last_error, createdAt: dreq(r.created_at),
 });
 const otpOf = (r: Row): Otp => ({
   orderId: r.order_id, ciphertext: r.ciphertext, expiresAt: dreq(r.expires_at), attempts: Number(r.attempts),
@@ -238,11 +240,14 @@ export class PostgresStore implements Store {
   }
   async getPaymentByReference(reference: string) { const r = await this.one("SELECT * FROM payments WHERE reference=$1", [reference]); return r ? paymentOf(r) : null; }
   async getPaymentByOrder(orderId: string) { const r = await this.one("SELECT * FROM payments WHERE order_id=$1 ORDER BY created_at DESC LIMIT 1", [orderId]); return r ? paymentOf(r) : null; }
-  async updatePayment(id: string, patch: Partial<Pick<Payment, "status" | "gatewayTransactionId" | "paidAt">>) {
+  async listPaymentsByOrder(orderId: string) {
+    return (await this.rows("SELECT * FROM payments WHERE order_id=$1 ORDER BY created_at DESC", [orderId])).map(paymentOf);
+  }
+  async updatePayment(id: string, patch: Partial<Pick<Payment, "status" | "gatewayTransactionId" | "paidAt" | "receivedKobo">>) {
     const r = await this.one(
       `UPDATE payments SET status=COALESCE($2,status), gateway_transaction_id=COALESCE($3,gateway_transaction_id),
-         paid_at=COALESCE($4,paid_at) WHERE id=$1 RETURNING *`,
-      [id, patch.status ?? null, patch.gatewayTransactionId ?? null, patch.paidAt ?? null],
+         paid_at=COALESCE($4,paid_at), received_kobo=COALESCE($5,received_kobo) WHERE id=$1 RETURNING *`,
+      [id, patch.status ?? null, patch.gatewayTransactionId ?? null, patch.paidAt ?? null, patch.receivedKobo ?? null],
     );
     return r ? paymentOf(r) : null;
   }
@@ -298,21 +303,49 @@ export class PostgresStore implements Store {
         [r.id, r.orderId, r.paymentId, r.amountKobo, r.reason, r.kind, r.status, r.requestedBy, r.gatewayRef, r.createdAt],
       );
     } catch (e) {
-      if (isUnique(e)) throw conflict("refund_exists", "Order already refunded");
+      if (isUnique(e)) throw conflict("refund_exists", "Payment already refunded");
       throw e;
     }
     return r;
   }
   async getRefund(id: string) { const r = await this.one("SELECT * FROM refunds WHERE id=$1", [id]); return r ? refundOf(r) : null; }
-  async listRefundsByStatus(statuses: Refund["status"][], olderThan: Date, limit: number) {
+  async listDueRefunds(now: Date, recordedBefore: Date, maxAttempts: number, limit: number) {
     return (await this.rows(
-      "SELECT * FROM refunds WHERE status = ANY($1::text[]) AND created_at <= $2 ORDER BY created_at LIMIT $3",
-      [statuses, olderThan, limit],
+      `SELECT * FROM refunds WHERE
+         (status = 'RECORDED' AND created_at <= $2 AND (next_attempt_at IS NULL OR next_attempt_at <= $1) AND attempts < $3)
+         OR (status = 'FAILED' AND next_attempt_at <= $1 AND attempts < $3)
+         OR (status = 'SUBMITTING' AND next_attempt_at <= $1)
+       ORDER BY created_at LIMIT $4`,
+      [now, recordedBefore, maxAttempts, limit],
     )).map(refundOf);
   }
-  async getRefundByOrder(orderId: string) { const r = await this.one("SELECT * FROM refunds WHERE order_id=$1", [orderId]); return r ? refundOf(r) : null; }
-  async updateRefund(id: string, patch: Partial<Pick<Refund, "status" | "gatewayRef">>) {
-    const r = await this.one("UPDATE refunds SET status=COALESCE($2,status), gateway_ref=COALESCE($3,gateway_ref) WHERE id=$1 RETURNING *", [id, patch.status ?? null, patch.gatewayRef ?? null]);
+  async claimRefund(id: string, now: Date, leaseUntil: Date, opts: { maxAttempts: number; force: boolean }) {
+    // One UPDATE over a row locked with SKIP LOCKED: a concurrent claimer skips the row instead of waiting, so exactly one wins.
+    const r = await this.one(
+      `UPDATE refunds SET status = 'SUBMITTING', attempts = attempts + 1, next_attempt_at = $3
+        WHERE id = (
+          SELECT id FROM refunds WHERE id = $1 AND (
+            (status IN ('RECORDED','FAILED') AND ($4::boolean OR ((next_attempt_at IS NULL OR next_attempt_at <= $2) AND attempts < $5)))
+            OR (status = 'SUBMITTING' AND next_attempt_at <= $2)
+            OR ($4::boolean AND status = 'EXHAUSTED')
+          ) FOR UPDATE SKIP LOCKED
+        ) RETURNING *`,
+      [id, now, leaseUntil, opts.force, opts.maxAttempts],
+    );
+    return r ? refundOf(r) : null;
+  }
+  async getRefundByOrder(orderId: string) { const r = await this.one("SELECT * FROM refunds WHERE order_id=$1 ORDER BY created_at LIMIT 1", [orderId]); return r ? refundOf(r) : null; }
+  async updateRefund(id: string, patch: RefundPatch) {
+    const sets: string[] = [];
+    const vals: unknown[] = [id];
+    const col: Record<keyof RefundPatch, string> = { status: "status", gatewayRef: "gateway_ref", nextAttemptAt: "next_attempt_at", lastError: "last_error" };
+    for (const k of Object.keys(col) as (keyof RefundPatch)[]) {
+      if (patch[k] === undefined) continue; // null is a real value (clears the column)
+      vals.push(patch[k]);
+      sets.push(`${col[k]}=$${vals.length}`);
+    }
+    if (sets.length === 0) return this.getRefund(id);
+    const r = await this.one(`UPDATE refunds SET ${sets.join(", ")} WHERE id=$1 RETURNING *`, vals);
     return r ? refundOf(r) : null;
   }
   async listRefunds(limit: number) { return (await this.rows("SELECT * FROM refunds ORDER BY created_at DESC LIMIT $1", [limit])).map(refundOf); }

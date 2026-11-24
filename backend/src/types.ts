@@ -94,13 +94,15 @@ export interface OrderFilter {
   limit?: number;
 }
 
-export type PaymentStatus = "PENDING" | "PAID" | "FAILED" | "MISMATCH";
+export type PaymentStatus = "PENDING" | "PAID" | "FAILED" | "MISMATCH" | "MISMATCH_REFUNDED";
 
 export interface Payment {
   id: string;
   orderId: string;
   reference: string;
   amountKobo: Kobo;
+  /** Amount the gateway reported for a MISMATCH charge (NGN only). Null otherwise. */
+  receivedKobo: Kobo | null;
   status: PaymentStatus;
   authorizationUrl: string | null;
   gatewayTransactionId: string | null;
@@ -129,7 +131,7 @@ export interface LedgerEntry {
   createdAt: Date;
 }
 
-export type RefundKind = "AUTO_TIMEOUT" | "AUTO_REJECT" | "ADMIN" | "LATE_PAYMENT";
+export type RefundKind = "AUTO_TIMEOUT" | "AUTO_REJECT" | "ADMIN" | "LATE_PAYMENT" | "MISMATCH";
 
 export interface Refund {
   id: string;
@@ -138,9 +140,13 @@ export interface Refund {
   amountKobo: Kobo;
   reason: string;
   kind: RefundKind;
-  status: "RECORDED" | "SUBMITTED" | "FAILED";
+  /** SUBMITTING is a claim held by one submitter until `nextAttemptAt` (the lease end). EXHAUSTED needs an operator. */
+  status: "RECORDED" | "SUBMITTING" | "SUBMITTED" | "FAILED" | "EXHAUSTED";
   requestedBy: string | null;
   gatewayRef: string | null;
+  attempts: number;
+  nextAttemptAt: Date | null;
+  lastError: string | null;
   createdAt: Date;
 }
 

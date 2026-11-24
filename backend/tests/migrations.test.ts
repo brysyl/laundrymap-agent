@@ -32,4 +32,14 @@ describe("001_init.sql (static)", () => {
     expect(m2).toMatch(/CREATE UNIQUE INDEX payments_one_pending_per_order ON payments \(order_id\) WHERE status = 'PENDING'/);
     expect(m2).toMatch(/refunds_unsettled_idx/);
   });
+  it("003 adds refund claim columns, a payment-keyed refund uniqueness and the mismatch states", () => {
+    const m3 = readFileSync(path.resolve(__dirname, "../migrations/003_refund_claims_and_mismatch_resolution.sql"), "utf8");
+    expect(m3).toMatch(/ADD COLUMN attempts integer NOT NULL DEFAULT 0/);
+    expect(m3).toMatch(/ADD COLUMN next_attempt_at timestamptz/);
+    expect(m3).toMatch(/'SUBMITTING'/);
+    expect(m3).toMatch(/'EXHAUSTED'/);
+    expect(m3).toMatch(/UNIQUE \(payment_id\)/);
+    expect(m3).toMatch(/'MISMATCH_REFUNDED'/);
+    expect(m3).toMatch(/received_kobo bigint/);
+  });
 });

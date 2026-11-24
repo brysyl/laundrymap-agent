@@ -46,7 +46,9 @@ export class PaymentService {
       // Idempotency key 2: the payment reference. A different event id for a paid reference is a no-op.
       if (payment.status === "PAID") return { outcome: "already_processed" as const };
       if (typeof d.amount !== "number" || !Number.isSafeInteger(d.amount) || d.amount !== payment.amountKobo || d.currency !== "NGN") {
-        await s.updatePayment(payment.id, { status: "MISMATCH" });
+        // Only a positive NGN amount can be refunded later by an admin; anything else is left for the Paystack dashboard.
+        const receivedKobo = d.currency === "NGN" && typeof d.amount === "number" && Number.isSafeInteger(d.amount) && d.amount > 0 ? d.amount : null;
+        await s.updatePayment(payment.id, { status: "MISMATCH", receivedKobo });
         await s.addAudit({
           id: randomUUID(), actorId: null, action: "payment.amount_mismatch", entityType: "payment", entityId: payment.id,
           metadata: { reference, expectedKobo: payment.amountKobo, receivedAmount: String(d.amount), currency: String(d.currency) }, createdAt: now,
@@ -64,7 +66,7 @@ export class PaymentService {
         this.logger.error({ err, reference }, "post-payment side effects failed");
       }
     } else if (result.outcome === "amount_mismatch") {
-      this.logger.warn({ reference }, "paystack amount mismatch, payment not applied");
+      this.logger.warn({ reference, alert: true }, "paystack amount mismatch, payment not applied; admin action required");
     }
     return result.outcome;
   }

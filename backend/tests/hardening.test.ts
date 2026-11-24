@@ -182,7 +182,7 @@ describe("one pending payment per order", () => {
     const order = await createOrder(h, w);
     await request(h.app).post(`/api/orders/${order.id}/pay`).set(auth(w.customer.token)).expect(200);
     const dup = { id: "00000000-0000-4000-8000-0000000000aa", orderId: order.id, reference: "dup", amountKobo: order.totalKobo, status: "PENDING" as const,
-      authorizationUrl: "u", gatewayTransactionId: null, paidAt: null, createdAt: h.clock.now() };
+      receivedKobo: null, authorizationUrl: "u", gatewayTransactionId: null, paidAt: null, createdAt: h.clock.now() };
     await expect(h.store.createPayment(dup)).rejects.toMatchObject({ status: 409, code: "payment_pending" });
   });
 
@@ -203,7 +203,7 @@ describe("one pending payment per order", () => {
     const { order, reference } = await createPaidOrder(h, w);
     // A later non-paid row must not hijack the refund.
     await h.store.createPayment({ id: "00000000-0000-4000-8000-0000000000bb", orderId: order.id, reference: "later", amountKobo: order.totalKobo,
-      status: "FAILED", authorizationUrl: null, gatewayTransactionId: null, paidAt: null, createdAt: new Date(h.clock.now().getTime() + 1000) });
+      receivedKobo: null, status: "FAILED", authorizationUrl: null, gatewayTransactionId: null, paidAt: null, createdAt: new Date(h.clock.now().getTime() + 1000) });
     h.clock.advance(120_000);
     await h.c.orders.expireStale();
     expect(h.gateway.refunds).toEqual([{ reference, amountKobo: order.totalKobo }]);

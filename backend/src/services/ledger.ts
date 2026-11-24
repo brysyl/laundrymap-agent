@@ -85,6 +85,15 @@ export const refundLines = (order: Order, amount: Kobo, reason: string): Line[] 
   { account: acct.refunds, direction: "CREDIT", amountKobo: amount, type: "REFUND", memo: `owed to customer ${order.customerId}` },
 ];
 
+/**
+ * A mismatched charge never reached escrow. Record the cash actually received and the matching
+ * liability to the customer in one posting; the refund submission then settles it at the gateway.
+ */
+export const mismatchRefundLines = (order: Order, received: Kobo, reason: string): Line[] => [
+  { account: acct.cash, direction: "DEBIT", amountKobo: received, type: "REFUND", memo: `mismatched charge received for order ${order.id}` },
+  { account: acct.refunds, direction: "CREDIT", amountKobo: received, type: "REFUND", memo: `owed to customer ${order.customerId}: ${reason}` },
+];
+
 export const payoutLines = (payableAccount: string, amount: Kobo): Line[] => [
   { account: payableAccount, direction: "DEBIT", amountKobo: amount, type: "PAYOUT", memo: "payout" },
   { account: acct.payouts, direction: "CREDIT", amountKobo: amount, type: "PAYOUT", memo: "paid out" },

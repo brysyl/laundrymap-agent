@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrate } from "../src/migrate";
 import { acct, payoutLines, post } from "../src/services/ledger";
 import { createPostgresStore } from "../src/store/postgres";
-import type { Order, Payment } from "../src/types";
+import type { Order, Payment, Refund } from "../src/types";
 
 /**
  * Runs only when TEST_DATABASE_URL points at a throwaway PostgreSQL database with PostGIS
@@ -42,7 +42,7 @@ d("PostgresStore against a live database", () => {
   }
 
   const pending = (orderId: string): Payment => ({
-    id: randomUUID(), orderId, reference: `ref_${randomUUID()}`, amountKobo: 1100, status: "PENDING",
+    id: randomUUID(), orderId, reference: `ref_${randomUUID()}`, amountKobo: 1100, receivedKobo: null, status: "PENDING",
     authorizationUrl: "https://pay.test/x", gatewayTransactionId: null, paidAt: null, createdAt: now(),
   });
 
@@ -113,5 +113,71 @@ d("PostgresStore against a live database", () => {
     const outcomes = await Promise.all([payout(), payout(), payout(), payout()]);
     expect(outcomes.filter(Boolean)).toHaveLength(1);
     expect(await s.accountBalance(account)).toBe(4000n);
+  });
+  async function seedPaidPayment(order: Order, status: Payment["status"] = "PAID"): Promise<Payment> {
+    const s = store();
+    const p = await s.createPayment({ ...pending(order.id), status: "FAILED" });
+    return (await s.updatePayment(p.id, { status, paidAt: now(), ...(status === "MISMATCH" ? { receivedKobo: 900 } : {}) }))!;
+  }
+  const recorded = (orderId: string, paymentId: string, createdAt = now()): Refund => ({
+    id: randomUUID(), orderId, paymentId, amountKobo: 1100, reason: "test refund", kind: "ADMIN", status: "RECORDED", requestedBy: null,
+    gatewayRef: null, attempts: 0, nextAttemptAt: null, lastError: null, createdAt,
+  });
+
+  it("finds the PAID payment and lists payments by status and by order", async () => {
+    const order = await seedOrder();
+    const s = store();
+    await s.createPayment({ ...pending(order.id), status: "FAILED" });
+    const paid = await seedPaidPayment(order);
+    const mismatch = await seedPaidPayment(order, "MISMATCH");
+    expect((await s.getPaidPaymentByOrder(order.id))?.id).toBe(paid.id);
+    expect((await s.listPaymentsByStatus("MISMATCH", 1000)).map((p) => p.id)).toContain(mismatch.id);
+    expect(mismatch.receivedKobo).toBe(900);
+    expect((await s.listPaymentsByOrder(order.id)).length).toBe(3);
+  });
+
+  it("allows only one refund per payment", async () => {
+    const order = await seedOrder();
+    const s = store();
+    const p = await seedPaidPayment(order);
+    await s.createRefund(recorded(order.id, p.id));
+    await expect(s.createRefund(recorded(order.id, p.id))).rejects.toMatchObject({ status: 409, code: "refund_exists" });
+  });
+
+  it("lists due refunds (ANY/status filters) and claims with SKIP LOCKED so exactly one concurrent claimer wins", async () => {
+    const order = await seedOrder();
+    const s = store();
+    const p = await seedPaidPayment(order);
+    const old = new Date(Date.now() - 3600_000);
+    const r = await s.createRefund(recorded(order.id, p.id, old));
+    expect((await s.listDueRefunds(now(), now(), 8, 1000)).map((x) => x.id)).toContain(r.id);
+
+    const lease = new Date(Date.now() + 300_000);
+    const results = await Promise.all(Array.from({ length: 6 }, () => s.claimRefund(r.id, now(), lease, { maxAttempts: 8, force: false })));
+    expect(results.filter((x) => x !== null)).toHaveLength(1);
+    expect(await s.getRefund(r.id)).toMatchObject({ status: "SUBMITTING", attempts: 1 });
+    expect((await s.listDueRefunds(now(), now(), 8, 1000)).map((x) => x.id)).not.toContain(r.id);
+    // A live lease blocks even a forced claim; an expired one does not.
+    expect(await s.claimRefund(r.id, now(), lease, { maxAttempts: 8, force: true })).toBeNull();
+    expect(await s.claimRefund(r.id, new Date(Date.now() + 301_000), lease, { maxAttempts: 8, force: false })).toMatchObject({ attempts: 2 });
+  });
+
+  it("applies backoff and the attempt cap in claimRefund, and updateRefund can clear columns", async () => {
+    const order = await seedOrder();
+    const s = store();
+    const p = await seedPaidPayment(order);
+    const r = await s.createRefund(recorded(order.id, p.id, new Date(Date.now() - 3600_000)));
+    const lease = new Date(Date.now() + 1000);
+    await s.claimRefund(r.id, now(), lease, { maxAttempts: 2, force: false });
+    const later = new Date(Date.now() + 600_000);
+    await s.updateRefund(r.id, { status: "FAILED", nextAttemptAt: later, lastError: "boom" });
+    expect(await s.claimRefund(r.id, now(), lease, { maxAttempts: 2, force: false })).toBeNull(); // in backoff
+    expect((await s.listDueRefunds(now(), now(), 2, 1000)).map((x) => x.id)).not.toContain(r.id);
+    expect(await s.claimRefund(r.id, new Date(later.getTime() + 1), lease, { maxAttempts: 2, force: false })).toMatchObject({ attempts: 2 });
+    await s.updateRefund(r.id, { status: "FAILED", nextAttemptAt: later });
+    expect(await s.claimRefund(r.id, new Date(later.getTime() + 1), lease, { maxAttempts: 2, force: false })).toBeNull(); // cap reached
+    await s.updateRefund(r.id, { status: "EXHAUSTED", nextAttemptAt: null, lastError: null });
+    expect(await s.getRefund(r.id)).toMatchObject({ status: "EXHAUSTED", nextAttemptAt: null, lastError: null });
+    expect(await s.claimRefund(r.id, now(), lease, { maxAttempts: 2, force: true })).toMatchObject({ status: "SUBMITTING" });
   });
 });

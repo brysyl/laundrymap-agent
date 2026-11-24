@@ -4,7 +4,7 @@ import type {
   ApprovalStatus, AuditLog, Courier, LedgerEntry, Order, OrderFilter, OrderPatch, OrderStatus, Otp,
   Payment, Refund, User, Vendor, VendorNearby,
 } from "../types";
-import type { Store, SystemCounts } from "./store";
+import type { RefundPatch, Store, SystemCounts } from "./store";
 import { haversineMeters } from "../geo";
 
 interface State {
@@ -21,6 +21,18 @@ interface State {
 }
 
 const clone = <T>(v: T): T => structuredClone(v);
+
+/** Mirrors the WHERE clause of PostgresStore.claimRefund. */
+function claimable(r: Refund, now: Date, maxAttempts: number, force: boolean): boolean {
+  const due = r.nextAttemptAt === null || r.nextAttemptAt.getTime() <= now.getTime();
+  switch (r.status) {
+    case "RECORDED":
+    case "FAILED": return force || (due && r.attempts < maxAttempts);
+    case "SUBMITTING": return due; // lease ended: the previous submitter is presumed dead
+    case "EXHAUSTED": return force;
+    case "SUBMITTED": return false;
+  }
+}
 
 function emptyState(): State {
   return {
@@ -174,6 +186,10 @@ export class MemoryStore implements Store {
     for (const p of this.state.payments.values()) if (p.orderId === orderId && p.status === "PAID") return clone(p);
     return null;
   }
+  async listPaymentsByOrder(orderId: string) {
+    return [...this.state.payments.values()].filter((p) => p.orderId === orderId)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).map(clone);
+  }
   async listPaymentsByStatus(status: Payment["status"], limit: number) {
     return [...this.state.payments.values()].filter((p) => p.status === status)
       .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit).map(clone);
@@ -187,7 +203,7 @@ export class MemoryStore implements Store {
       .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     return clone(list[0] ?? null);
   }
-  async updatePayment(id: string, patch: Partial<Pick<Payment, "status" | "gatewayTransactionId" | "paidAt">>) {
+  async updatePayment(id: string, patch: Partial<Pick<Payment, "status" | "gatewayTransactionId" | "paidAt" | "receivedKobo">>) {
     const p = this.state.payments.get(id);
     if (!p) return null;
     Object.assign(p, patch);
@@ -225,21 +241,29 @@ export class MemoryStore implements Store {
   }
 
   async createRefund(r: Refund) {
-    for (const x of this.state.refunds.values()) if (x.orderId === r.orderId) throw conflict("refund_exists", "Order already refunded");
+    for (const x of this.state.refunds.values()) if (x.paymentId === r.paymentId) throw conflict("refund_exists", "Payment already refunded");
     this.state.refunds.set(r.id, clone(r));
     return clone(r);
   }
   async getRefund(id: string) { return clone(this.state.refunds.get(id) ?? null); }
-  async listRefundsByStatus(statuses: Refund["status"][], olderThan: Date, limit: number) {
+  async listDueRefunds(now: Date, recordedBefore: Date, maxAttempts: number, limit: number) {
     return [...this.state.refunds.values()]
-      .filter((r) => statuses.includes(r.status) && r.createdAt.getTime() <= olderThan.getTime())
+      .filter((r) => (r.status !== "RECORDED" || r.createdAt.getTime() <= recordedBefore.getTime()) && claimable(r, now, maxAttempts, false))
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()).slice(0, limit).map(clone);
+  }
+  async claimRefund(id: string, now: Date, leaseUntil: Date, opts: { maxAttempts: number; force: boolean }) {
+    const r = this.state.refunds.get(id);
+    if (!r || !claimable(r, now, opts.maxAttempts, opts.force)) return null;
+    r.status = "SUBMITTING";
+    r.attempts += 1;
+    r.nextAttemptAt = leaseUntil;
+    return clone(r);
   }
   async getRefundByOrder(orderId: string) {
     for (const r of this.state.refunds.values()) if (r.orderId === orderId) return clone(r);
     return null;
   }
-  async updateRefund(id: string, patch: Partial<Pick<Refund, "status" | "gatewayRef">>) {
+  async updateRefund(id: string, patch: RefundPatch) {
     const r = this.state.refunds.get(id);
     if (!r) return null;
     Object.assign(r, patch);

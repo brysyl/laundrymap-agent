@@ -227,9 +227,13 @@ export function createApp(c: Container): express.Express {
   app.post("/api/admin/refunds/:id/retry", ...adminOnly, wrap(async (req, res) => {
     res.json({ refund: await c.orders.adminRetryRefund(me(req), idParam(req)) });
   }));
-  // Charges whose amount or currency did not match the order. The money is held at the gateway and needs an operator.
+  // Charges whose amount or currency did not match the order. The money is held at the gateway until an admin refunds it (refund-mismatch).
   app.get("/api/admin/payments/mismatched", ...adminOnly, wrap(async (_req, res) => {
     res.json({ payments: await c.store.listPaymentsByStatus("MISMATCH", 200) });
+  }));
+  app.post("/api/admin/payments/:id/refund-mismatch", ...adminOnly, wrap(async (req, res) => {
+    const b = z.object({ confirm: z.string(), reason: z.string().trim().min(5).max(300) }).parse(req.body);
+    res.json(await c.orders.refundMismatchedPayment(me(req), idParam(req), b));
   }));
   app.get("/api/admin/audit", ...adminOnly, wrap(async (_req, res) => { res.json({ audit: await c.store.listAudit(200) }); }));
   app.get("/api/admin/system", ...adminOnly, wrap(async (_req, res) => {

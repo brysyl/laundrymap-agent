@@ -9,7 +9,7 @@ import type { Cache } from "../cache/cache";
 import type { Store } from "../store/store";
 import type { Clock, Order, OrderStatus, Payment, Refund, RefundKind, User } from "../types";
 import type { PaymentGateway } from "./gateway";
-import { paymentLines, post, refundLines, settlementLines } from "./ledger";
+import { mismatchRefundLines, paymentLines, post, refundLines, settlementLines } from "./ledger";
 import type { OtpService } from "./otp";
 import { REFUNDABLE, predecessors } from "./stateMachine";
 
@@ -138,7 +138,11 @@ export class OrderService {
     const order = await this.getFor(customer, id);
     if (customer.role !== "CUSTOMER") throw forbidden();
     if (order.status !== "PENDING_PAYMENT") throw conflict("invalid_state", "Order is not awaiting payment");
-    const existing = await this.d.store.getPaymentByOrder(id);
+    const payments = await this.d.store.listPaymentsByOrder(id);
+    if (payments.some((p) => p.status === "MISMATCH")) {
+      throw conflict("payment_mismatch_unresolved", "A previous charge for this order did not match the order amount and is awaiting review. Contact support.");
+    }
+    const existing = payments[0];
     if (existing && existing.status === "PENDING" && existing.authorizationUrl) {
       return { reference: existing.reference, authorizationUrl: existing.authorizationUrl };
     }
@@ -148,7 +152,7 @@ export class OrderService {
     });
     try {
       await this.d.store.createPayment({
-        id: randomUUID(), orderId: order.id, reference, amountKobo: order.totalKobo, status: "PENDING",
+        id: randomUUID(), orderId: order.id, reference, amountKobo: order.totalKobo, receivedKobo: null, status: "PENDING",
         authorizationUrl, gatewayTransactionId: null, paidAt: null, createdAt: this.d.clock.now(),
       });
     } catch (err) {
@@ -331,7 +335,7 @@ export class OrderService {
     await post(s, order.id, refundLines(order, payment.amountKobo, reason), now);
     const refund = await s.createRefund({
       id: randomUUID(), orderId: order.id, paymentId: payment.id, amountKobo: payment.amountKobo, reason, kind,
-      status: "RECORDED", requestedBy: actorId, gatewayRef: null, createdAt: now,
+      status: "RECORDED", requestedBy: actorId, gatewayRef: null, attempts: 0, nextAttemptAt: null, lastError: null, createdAt: now,
     });
     await s.addAudit({
       id: randomUUID(), actorId, action: `order.refund.${kind.toLowerCase()}`, entityType: "order", entityId: order.id,
@@ -340,46 +344,129 @@ export class OrderService {
     return { order: updated, refund };
   }
 
-  /** Submits a RECORDED or FAILED refund to the gateway. Returns the resulting status. */
-  async submitRefund(refund: Refund): Promise<Refund["status"]> {
-    const payment = await this.d.store.getPayment(refund.paymentId);
-    if (!payment) return refund.status;
-    try {
-      const r = await this.d.gateway.refund({ reference: payment.reference, amountKobo: refund.amountKobo });
-      await this.d.store.updateRefund(refund.id, { status: "SUBMITTED", gatewayRef: r.gatewayRef });
-      return "SUBMITTED";
-    } catch (err) {
-      await this.d.store.updateRefund(refund.id, { status: "FAILED" });
-      this.d.logger.error({ err, refundId: refund.id, orderId: refund.orderId }, "gateway refund submission failed; the worker will retry");
-      return "FAILED";
-    }
+  /** Delay before the next attempt after `attempts` failures: base, 2x base, 4x base ... capped. */
+  private backoffMs(attempts: number): number {
+    const base = this.d.config.refundRetryMinAgeMs;
+    return Math.min(base * 2 ** Math.max(0, attempts - 1), this.d.config.refundBackoffMaxMs);
   }
 
   /**
-   * Worker sweep: re-submits refunds that are FAILED, or RECORDED because the process died
-   * before the gateway call. Refunds younger than `refundRetryMinAgeMs` are skipped so a
-   * request that is still submitting is not raced. Returns the number now SUBMITTED.
+   * Claims the refund (RECORDED/FAILED/lease-expired SUBMITTING -> SUBMITTING, atomically in the store),
+   * then calls the gateway. Returns null when another submitter holds the claim or the refund is not due.
+   * A gateway error sets FAILED with exponential backoff, or EXHAUSTED once the attempt cap is reached.
+   */
+  private async attemptRefund(refund: Refund, force: boolean): Promise<Refund["status"] | null> {
+    const now = this.d.clock.now();
+    const claimed = await this.d.store.claimRefund(refund.id, now, new Date(now.getTime() + this.d.config.refundClaimLeaseMs), {
+      maxAttempts: this.d.config.refundMaxAttempts, force,
+    });
+    if (!claimed) return null;
+    let gatewayRef: string | null;
+    try {
+      const payment = await this.d.store.getPayment(claimed.paymentId);
+      if (!payment) throw new Error("payment for refund not found");
+      gatewayRef = (await this.d.gateway.refund({ reference: payment.reference, amountKobo: claimed.amountKobo })).gatewayRef;
+    } catch (err) {
+      return this.failRefund(claimed, err);
+    }
+    try {
+      await this.d.store.updateRefund(claimed.id, { status: "SUBMITTED", gatewayRef, nextAttemptAt: null, lastError: null });
+    } catch (err) {
+      // The gateway accepted the refund. Do not mark it FAILED: that would resend it. The claim lease ends and a later sweep
+      // re-claims it; Paystack rejects a second full refund of the same transaction.
+      this.d.logger.error({ err, refundId: claimed.id, orderId: claimed.orderId, gatewayRef }, "gateway accepted refund but recording SUBMITTED failed");
+      return "SUBMITTING";
+    }
+    return "SUBMITTED";
+  }
+
+  private async failRefund(claimed: Refund, err: unknown): Promise<Refund["status"]> {
+    const now = this.d.clock.now();
+    const lastError = (err instanceof Error ? err.message : String(err)).slice(0, 500);
+    if (claimed.attempts >= this.d.config.refundMaxAttempts) {
+      await this.d.store.updateRefund(claimed.id, { status: "EXHAUSTED", nextAttemptAt: null, lastError });
+      await this.d.store.addAudit({
+        id: randomUUID(), actorId: null, action: "refund.exhausted", entityType: "refund", entityId: claimed.id,
+        metadata: { orderId: claimed.orderId, attempts: claimed.attempts, lastError }, createdAt: now,
+      });
+      this.d.logger.error({ err, alert: true, refundId: claimed.id, orderId: claimed.orderId, attempts: claimed.attempts },
+        "refund exhausted its attempts; an operator must retry it or refund in the Paystack dashboard");
+      return "EXHAUSTED";
+    }
+    const nextAttemptAt = new Date(now.getTime() + this.backoffMs(claimed.attempts));
+    await this.d.store.updateRefund(claimed.id, { status: "FAILED", nextAttemptAt, lastError });
+    this.d.logger.error({ err, refundId: claimed.id, orderId: claimed.orderId, attempts: claimed.attempts, nextAttemptAt },
+      "gateway refund submission failed; the worker will retry after backoff");
+    return "FAILED";
+  }
+
+  /** Submits a refund to the gateway if it can be claimed. Returns the resulting status (unchanged if not claimed). */
+  async submitRefund(refund: Refund): Promise<Refund["status"]> {
+    return (await this.attemptRefund(refund, false)) ?? refund.status;
+  }
+
+  /**
+   * Worker sweep: submits refunds that are due. Backoff, the attempt cap and the store-level claim keep
+   * repeated ticks, other instances and admin retries from sending the same refund twice.
+   * Returns the number now SUBMITTED.
    */
   async retryRefunds(): Promise<number> {
-    const cutoff = new Date(this.d.clock.now().getTime() - this.d.config.refundRetryMinAgeMs);
-    const due = await this.d.store.listRefundsByStatus(["RECORDED", "FAILED"], cutoff, 50);
+    const now = this.d.clock.now();
+    const recordedBefore = new Date(now.getTime() - this.d.config.refundRetryMinAgeMs);
+    const due = await this.d.store.listDueRefunds(now, recordedBefore, this.d.config.refundMaxAttempts, 50);
     let n = 0;
-    for (const r of due) if ((await this.submitRefund(r)) === "SUBMITTED") n++;
+    for (const r of due) if ((await this.attemptRefund(r, false)) === "SUBMITTED") n++;
     return n;
   }
 
-  /** Admin retry of one unsettled refund. */
+  /** Admin retry of one unsettled refund. Ignores backoff and the attempt cap, but not another submitter's live claim. */
   async adminRetryRefund(admin: User, refundId: string): Promise<Refund> {
     if (admin.role !== "ADMIN") throw forbidden();
     const refund = await this.d.store.getRefund(refundId);
     if (!refund) throw notFound("Refund");
     if (refund.status === "SUBMITTED") throw conflict("already_submitted", "Refund was already submitted to the gateway");
-    await this.submitRefund(refund);
+    const status = await this.attemptRefund(refund, true);
+    if (status === null) throw conflict("refund_in_flight", "Another submitter is handling this refund");
     await this.d.store.addAudit({
       id: randomUUID(), actorId: admin.id, action: "refund.retry", entityType: "refund", entityId: refund.id,
-      metadata: { orderId: refund.orderId }, createdAt: this.d.clock.now(),
+      metadata: { orderId: refund.orderId, result: status }, createdAt: this.d.clock.now(),
     });
     return (await this.d.store.getRefund(refundId)) as Refund;
+  }
+
+  /**
+   * Admin resolution of a MISMATCH charge: refunds the amount the gateway actually received.
+   * One transaction marks the payment MISMATCH_REFUNDED (which also lifts the block on new payments),
+   * posts cash and refund liability to the ledger, records the refund and writes the audit row.
+   * `confirm` must equal the payment id.
+   */
+  async refundMismatchedPayment(admin: User, paymentId: string, input: { confirm: string; reason: string }): Promise<{ payment: Payment; refund: Refund }> {
+    if (admin.role !== "ADMIN") throw forbidden();
+    if (input.confirm !== paymentId) throw badRequest("confirmation_required", "confirm must equal the payment id");
+    const now = this.d.clock.now();
+    const r = await this.d.store.tx(async (s) => {
+      const payment = await s.getPayment(paymentId);
+      if (!payment) throw notFound("Payment");
+      if (payment.status !== "MISMATCH") throw conflict("not_mismatched", `Payment is ${payment.status}, not MISMATCH`);
+      if (payment.receivedKobo === null) {
+        throw conflict("received_amount_unknown", "The received amount or currency is not refundable here; refund it in the Paystack dashboard");
+      }
+      const order = await s.getOrder(payment.orderId);
+      if (!order) throw notFound("Order");
+      const updated = await s.updatePayment(payment.id, { status: "MISMATCH_REFUNDED" });
+      await post(s, order.id, mismatchRefundLines(order, payment.receivedKobo, input.reason), now);
+      const refund = await s.createRefund({
+        id: randomUUID(), orderId: order.id, paymentId: payment.id, amountKobo: payment.receivedKobo, reason: input.reason, kind: "MISMATCH",
+        status: "RECORDED", requestedBy: admin.id, gatewayRef: null, attempts: 0, nextAttemptAt: null, lastError: null, createdAt: now,
+      });
+      await s.addAudit({
+        id: randomUUID(), actorId: admin.id, action: "payment.mismatch_refund", entityType: "payment", entityId: payment.id,
+        metadata: { orderId: order.id, reference: payment.reference, expectedKobo: payment.amountKobo, refundedKobo: payment.receivedKobo, reason: input.reason }, createdAt: now,
+      });
+      return { payment: updated as Payment, refund };
+    });
+    await this.submitRefund(r.refund);
+    return { payment: r.payment, refund: (await this.d.store.getRefund(r.refund.id)) as Refund };
   }
 
   private async refundAndPublish(order: Order, from: OrderStatus[], kind: RefundKind, reason: string, actorId: string | null): Promise<Order> {
