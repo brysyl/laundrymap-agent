@@ -1,13 +1,30 @@
 # LaundryMap
 
-On-demand laundry marketplace for Nigeria, built as an installable PWA. Customers find nearby vendors, pay through Paystack, and track pickup and delivery. Vendors accept and process orders. Couriers claim and deliver them. Admins approve vendors and couriers, issue refunds and record payouts.
+**Nigeria, Nasarawa × Abuja.** Laundry-Map is an on-demand laundry marketplace built as an installable PWA for the Karu–Mararaba corridor in Nasarawa State and the neighbouring FCT/Abuja border. The product promise is clean blue washing water, soaps and detergent laundry care, and neighborhood discovery and tracking along the corridor.
+
+What is implemented today:
+
+- Customers find approved vendors by radius search around their location (`GET /api/vendors/nearby`, PostGIS in Postgres), sorted by distance and shown as a list. The customer page falls back to a point near Karu (9.0, 7.59) when location is unavailable and searches a 10 km radius.
+- Demo seed data (`SEED_DEMO=true`) contains four vendors in Mararaba, Karu, Gurku and New Karu (`backend/src/services/vendors.ts`). There is no seed data for the Abuja side. Vendors register their own coordinates from the browser's location.
+- Customers pay through Paystack and track an order by status, with live Socket.IO updates. A courier's location is posted to the API while a job is active.
+- Vendors accept and process orders. Couriers claim and deliver them with a delivery OTP. Admins approve vendors and couriers, issue refunds and record payouts.
+
+Not implemented: there is no interactive map. The frontend has no map tiles or map widget, so "corridor map discovery" means the nearby-vendor list, and tracking means order status and live updates, not a courier pin on a map. Nothing in the code models water quality, soap or detergent products. Vendors list a unit price and customers describe items as free text, so the blue-water and detergent positioning is branding, not a feature.
 
 - `frontend/`: Next.js 16 PWA (service worker, offline queue, role dashboards).
 - `backend/`: Express 4 and Socket.IO API in TypeScript, with PostgreSQL/PostGIS, Redis, and an in-memory store and cache for development and tests.
 
+## Architecture
+
+- The browser reaches the API through a Next.js rewrite of `/api/*` (`API_PROXY_TARGET`) and Socket.IO directly (`NEXT_PUBLIC_SOCKET_URL`).
+- Routes live in `backend/src/http/app.ts` and call services in `backend/src/services` (orders, payments, ledger, OTP, vendors, auth, state machine). Services use the `Store` interface (`MemoryStore` for dev and tests, `PostgresStore` for production) and a cache (in-memory or Redis).
+- Order status changes go through a state machine with compare-and-set updates. Money is integer kobo and the ledger is double entry.
+- The timeout and refund sweeper runs inside the API process (`backend/src/worker.ts`).
+- The frontend keeps pure logic in `frontend/src/lib` (retry queue, throttle, countdown, connection state). `frontend/public/sw.js` and `sw-routing.js` implement caching and the `/offline` fallback.
+
 ## Verification status
 
-Run in the authoring sandbox: typecheck, unit and integration tests (in-memory store and cache), and both production builds.
+Run in the authoring sandbox: typecheck, unit and integration tests (in-memory store and cache), and both production builds. The Postgres integration suite is skipped there, so it has not been run by the authors.
 
 Not run anywhere yet, so treat as unverified until the staging checklist below is done:
 
@@ -36,19 +53,51 @@ npm run dev --workspace=frontend
 
 Full stack with Postgres and Redis: copy `.env.example` to `.env`, fill in the placeholders, then `docker compose up --build`. Compose runs Postgres and Redis without TLS, so the backend runs with `NODE_ENV=development` there. See the comments at the top of `docker-compose.yml` for enabling TLS.
 
-## PWA build and test
+## Testing and verification
 
 ```bash
 npm run typecheck
-npm test
+npm test                                   # backend then frontend
+npm test --workspace=backend
+npm test --workspace=frontend
 npm run build --workspace=backend
 npm run build --workspace=frontend
 ```
 
+Postgres integration tests need a PostGIS database. Without `TEST_DATABASE_URL` they are skipped (`describe.skip`), which is what the counts below reflect:
+
+```bash
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=laundrymap_test postgis/postgis:16-3.4
+TEST_DATABASE_URL=postgres://postgres:pw@localhost:5432/laundrymap_test npm test --workspace=backend
+```
+
+Use a throwaway database, because the suite applies the migrations to it. CI (`.github/workflows/ci.yml`) provides a PostGIS service and sets `TEST_DATABASE_URL`.
+
+Results without `TEST_DATABASE_URL`:
+
+- Backend: 12 test files passed and 1 skipped, 124 tests passed and 13 skipped. All 13 skipped tests are in `postgres.integration.test.ts`.
+- Frontend: 7 test files, 72 tests passed.
+
+Counts change as tests are added, so re-run to confirm.
+
+Backend tests (`backend/tests`):
+
+| File | Covers |
+| --- | --- |
+| `lifecycle.test.ts` | Order lifecycle from payment to delivery. |
+| `rbac.test.ts`, `invariants.test.ts` | Role checks, ledger balance across lifecycles, kobo split sweep, webhook edge cases, nearby vendor filtering. |
+| `webhook.test.ts`, `refund-claims.test.ts`, `timeout.test.ts` | Paystack signature and dedupe, refund claims, backoff and cap, vendor timeout. |
+| `otp.test.ts`, `money.test.ts`, `config.test.ts`, `socket.test.ts`, `hardening.test.ts` | OTP, money math, config validation, socket rooms and sessions, review fixes. |
+| `migrations.test.ts` | Static checks of the SQL migration files (always run). |
+| `postgres.integration.test.ts` | `PostgresStore`, migrations, triggers, payout locking (needs `TEST_DATABASE_URL`). |
+
+Frontend tests (`frontend/tests`): `lib.test.ts` (countdown, `formatNaira`, connection banner, offline page, service worker policy, location throttle, realtime sync, submit guard), `sw.test.ts` (service worker routing, wiring and offline fallback), `api.test.ts`, `client.test.ts`, `config.test.ts`, `manifest.test.ts` and `submitGuard.test.ts`. They run in a Node environment without a DOM, so React components are not rendered.
+
+## PWA build
+
 - Root `npm run typecheck`, `npm test` and `npm run build` run the same script in both workspaces.
 - Regenerate the PWA icons with `npm run icons --workspace=frontend`. The PNGs in `frontend/public/icons` are committed.
 - Service workers only register in production builds. To try offline behavior: `npm run build --workspace=frontend && npm run start --workspace=frontend`, open the site in Chrome, then use DevTools Application and Network panels.
-- Frontend tests cover the manifest, service worker logic and the offline queue. Backend tests cover the order lifecycle, RBAC, OTP, ledger, Paystack webhook, vendor timeout and sockets.
 
 ## Environment variables
 
